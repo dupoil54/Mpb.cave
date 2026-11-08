@@ -64,3 +64,14 @@ En local, la base par défaut est `cave.db` à côté de `main.py`. Pour choisir
 ## Rapports
 
 Les périodes disponibles restent : jour, semaine, mois et année. Le tableau « Coût des produits vendus par catégorie » s'appuie sur le coût d'achat enregistré dans chaque ligne de vente. Pour obtenir des marges fiables, renseigner le prix d'achat des articles et tenir à jour les charges.
+
+## Version 2.4 — Modes de paiement
+
+- À l'encaissement d'un reçu, le caissier choisit obligatoirement **Cash** ou **Paiement mobile**.
+- Le même choix est proposé lors du règlement d'une ardoise afin que tous les encaissements soient ventilés correctement.
+- Les rapports financiers affichent les montants encaissés en Cash, en Paiement mobile et le total réellement encaissé pour la période sélectionnée.
+- La ventilation utilise la date réelle de l'encaissement et inclut les paiements partiels ainsi que les règlements d'ardoises.
+- Migration non destructive : la colonne `method` est ajoutée à `credit_payments` si elle n'existe pas.
+- Les anciens paiements enregistrés sous `Espèces` sont comptabilisés dans **Cash**. Les paiements anciens avec un mode non reconnu restent visibles dans « Autre / ancien mode ».
+
+Les deux modes autorisés pour les nouveaux encaissements sont `Cash` et `Paiement mobile`.

@@ -69,6 +69,7 @@ def init():
     CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY,label TEXT,amount REAL,category TEXT,day TEXT,note TEXT,employee_id INTEGER,created TEXT);
     ''')
     # migrations non destructives
+    if 'method' not in cols(c,'credit_payments'): c.execute("ALTER TABLE credit_payments ADD COLUMN method TEXT DEFAULT 'Cash'")
     # Conserver la catégorie au moment de la vente : les anciens rapports restent exacts
     # même si le nom ou la catégorie de l'article est modifié ultérieurement.
     if 'category' not in cols(c,'order_items'):
@@ -107,8 +108,13 @@ class ProductIn(BaseModel): name:str; stock:float; code:Optional[str]=None; cate
 class TableIn(BaseModel): name:str
 class ItemIn(BaseModel): product_id:int; qty:float
 class OrderIn(BaseModel): table_id:Optional[int]=None; customer:str='Client'; items:List[ItemIn]; source:str='staff'
-class PayIn(BaseModel): amount:float; method:str='Espèces'
-class CreditPay(BaseModel): amount:float
+class PayIn(BaseModel): amount:float; method:str='Cash'
+def normalize_payment_method(method):
+    value=(method or '').strip().lower()
+    if value in ('cash','espèces','especes','espèce','espece'): return 'Cash'
+    if value in ('paiement mobile','mobile money','mobile','orange money','mtn momo','momo'): return 'Paiement mobile'
+    raise HTTPException(400,"Mode de paiement invalide. Choisissez Cash ou Paiement mobile.")
+class CreditPay(BaseModel): amount:float; method:str='Cash'
 class MoveIn(BaseModel): product_id:int; qty:float; kind:str='in'; note:str=''
 class AttendanceIn(BaseModel): employee_id:int; day:str; status:str='present'
 class ExpenseIn(BaseModel): label:str; amount:float; category:str='Autres'; day:str; note:str=''
@@ -233,7 +239,8 @@ def pay(oid:int,x:PayIn,authorization:Optional[str]=Header(None)):
     if not o: c.close(); raise HTTPException(404,'Reçu introuvable')
     total=c.execute('SELECT coalesce(sum(qty*unit_price),0) FROM order_items WHERE order_id=?',(oid,)).fetchone()[0]; due=total-o['paid']-o['credit']
     if x.amount<=0 or x.amount>due+0.001: c.close(); raise HTTPException(400,'Montant invalide')
-    c.execute('INSERT INTO payments(order_id,amount,method,created,employee_id) VALUES(?,?,?,?,?)',(oid,x.amount,x.method,now(),e['id'])); c.execute('UPDATE orders SET paid=paid+? WHERE id=?',(x.amount,oid)); left=due-x.amount
+    method=normalize_payment_method(x.method)
+    c.execute('INSERT INTO payments(order_id,amount,method,created,employee_id) VALUES(?,?,?,?,?)',(oid,x.amount,method,now(),e['id'])); c.execute('UPDATE orders SET paid=paid+? WHERE id=?',(x.amount,oid)); left=due-x.amount
     if left<=0.001: c.execute("UPDATE orders SET status='paid' WHERE id=?",(oid,))
     c.commit(); c.close(); log(e,'PAIEMENT',f'Commande #{oid}: {x.amount}'); return {'remaining':max(0,left)}
 @app.post('/api/orders/{oid}/credit')
@@ -251,7 +258,8 @@ def pay_credit(cid:int,x:CreditPay,authorization:Optional[str]=Header(None)):
     e=employee(authorization); allow(e,'admin','shareholder','cashier'); c=db(); cr=c.execute('SELECT * FROM credits WHERE id=?',(cid,)).fetchone()
     if not cr: c.close(); raise HTTPException(404,'Ardoise introuvable')
     if x.amount<=0 or x.amount>cr['balance']: c.close(); raise HTTPException(400,'Montant invalide')
-    c.execute('INSERT INTO credit_payments(credit_id,amount,created,employee_id) VALUES(?,?,?,?)',(cid,x.amount,now(),e['id'])); c.execute('UPDATE credits SET balance=balance-? WHERE id=?',(x.amount,cid)); c.commit(); c.close(); log(e,'REGLEMENT_ARDOISE',f'Ardoise #{cid}: {x.amount}'); return {'ok':True}
+    method=normalize_payment_method(x.method)
+    c.execute('INSERT INTO credit_payments(credit_id,amount,created,employee_id,method) VALUES(?,?,?,?,?)',(cid,x.amount,now(),e['id'],method)); c.execute('UPDATE credits SET balance=balance-? WHERE id=?',(x.amount,cid)); c.commit(); c.close(); log(e,'REGLEMENT_ARDOISE',f'Ardoise #{cid}: {x.amount}'); return {'ok':True}
 @app.get('/api/receipt/{oid}')
 def receipt(oid:int,authorization:Optional[str]=Header(None)):
     employee(authorization); c=db(); o=c.execute('SELECT o.*,t.name table_name FROM orders o LEFT JOIN tables_room t ON t.id=o.table_id WHERE o.id=?',(oid,)).fetchone()
@@ -358,9 +366,26 @@ def reports(period:str='day',anchor:Optional[str]=None,authorization:Optional[st
     expenses=c.execute('SELECT coalesce(sum(amount),0) total FROM expenses WHERE day BETWEEN ? AND ?',(start,end)).fetchone()['total']
     count=c.execute("SELECT count(*) n FROM orders WHERE status IN ('paid','credit') AND substr(created,1,10) BETWEEN ? AND ?",(start,end)).fetchone()['n']
     categories=c.execute("SELECT COALESCE(NULLIF(i.category,''),'Autres') category, COALESCE(SUM(i.qty*i.unit_price),0) sales, COALESCE(SUM(i.qty*i.unit_cost),0) cost, COALESCE(SUM(i.qty*(i.unit_price-i.unit_cost)),0) gross_profit, COALESCE(SUM(i.qty),0) quantity FROM order_items i JOIN orders o ON o.id=i.order_id WHERE o.status IN ('paid','credit') AND substr(o.created,1,10) BETWEEN ? AND ? GROUP BY COALESCE(NULLIF(i.category,''),'Autres') ORDER BY cost DESC",(start,end)).fetchall()
+    # Ventilation des encaissements par date réelle de paiement (et non date de création
+    # de la commande), en incluant les règlements d'ardoises. Les anciennes valeurs
+    # 'Espèces' sont regroupées dans Cash pour conserver l'historique.
+    payment_rows=c.execute("""SELECT method, SUM(amount) amount FROM (
+        SELECT CASE WHEN lower(trim(COALESCE(method,''))) IN ('cash','espèces','especes','espèce','espece') THEN 'Cash'
+                    WHEN lower(trim(COALESCE(method,''))) IN ('paiement mobile','mobile money','mobile','orange money','mtn momo','momo') THEN 'Paiement mobile'
+                    ELSE 'Autre / ancien mode' END method, amount, created FROM payments
+        UNION ALL
+        SELECT CASE WHEN lower(trim(COALESCE(method,'Cash'))) IN ('cash','espèces','especes','espèce','espece') THEN 'Cash'
+                    WHEN lower(trim(COALESCE(method,'Cash'))) IN ('paiement mobile','mobile money','mobile','orange money','mtn momo','momo') THEN 'Paiement mobile'
+                    ELSE 'Autre / ancien mode' END method, amount, created FROM credit_payments
+    ) WHERE substr(created,1,10) BETWEEN ? AND ? GROUP BY method""",(start,end)).fetchall()
+    payment_breakdown={r['method']:r['amount'] for r in payment_rows}
+    cash_received=payment_breakdown.get('Cash',0)
+    mobile_received=payment_breakdown.get('Paiement mobile',0)
+    other_received=payment_breakdown.get('Autre / ancien mode',0)
+    total_received=cash_received+mobile_received+other_received
     c.close()
     gross=sales-cost
-    return {'period':period,'start':start,'end':end,'sales':sales,'cost_of_goods':cost,'gross_profit':gross,'expenses':expenses,'net_estimate':gross-expenses,'orders':count,'by_category':[dict(x) for x in categories]}
+    return {'period':period,'start':start,'end':end,'sales':sales,'cost_of_goods':cost,'gross_profit':gross,'expenses':expenses,'net_estimate':gross-expenses,'orders':count,'by_category':[dict(x) for x in categories], 'cash_received':cash_received, 'mobile_received':mobile_received, 'other_received':other_received, 'total_received':total_received, 'payments_by_method':payment_breakdown}
 @app.get('/api/audit')
 def audit(authorization:Optional[str]=Header(None)):
     e=employee(authorization); allow(e,'admin','shareholder','cashier'); c=db(); r=c.execute('SELECT a.*,e.name employee FROM audit a LEFT JOIN employees e ON e.id=a.employee_id ORDER BY a.id DESC LIMIT 300').fetchall(); c.close(); return [dict(x) for x in r]
