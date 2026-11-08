@@ -233,6 +233,53 @@ def edit_order(oid:int,x:OrderIn,authorization:Optional[str]=Header(None)):
     for it in x.items:
         p=c.execute('SELECT * FROM products WHERE id=?',(it.product_id,)).fetchone(); c.execute('INSERT INTO order_items(order_id,product_id,qty,unit_price,unit_cost,category) VALUES(?,?,?,?,?,?)',(oid,it.product_id,it.qty,p['price'],p['cost'],p['category'] or 'Autres')); c.execute('UPDATE products SET stock=stock-? WHERE id=?',(it.qty,it.product_id))
     c.execute('UPDATE orders SET customer=? WHERE id=?',(x.customer,oid)); c.commit(); c.close(); log(e,'MODIFICATION_RECU',f'Commande #{oid}'); return {'ok':True}
+@app.patch('/api/orders/{oid}/edit-paid')
+def edit_paid_order(oid:int,x:OrderIn,authorization:Optional[str]=Header(None)):
+    """Corrige un reçu payé : stock compensé et lignes comptables remplacées."""
+    e=employee(authorization); admin_or_share(e)
+    if not x.items: raise HTTPException(400,'Le panier doit contenir au moins un article.')
+    c=db()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        o=c.execute("SELECT * FROM orders WHERE id=? AND status='paid'",(oid,)).fetchone()
+        if not o: raise HTTPException(404,'Reçu payé introuvable ou non modifiable.')
+        if float(o['credit'] or 0)>0.001: raise HTTPException(400,'Ce reçu est lié à une ardoise. Régularisez-la avant toute correction.')
+        old=c.execute('SELECT * FROM order_items WHERE order_id=?',(oid,)).fetchall()
+        # Le stock vendu initialement est d'abord restitué dans la transaction.
+        for it in old:
+            c.execute('UPDATE products SET stock=stock+? WHERE id=?',(it['qty'],it['product_id']))
+        # Valider les articles et les quantités avant de remplacer les lignes.
+        new_lines=[]
+        for it in x.items:
+            if it.qty<=0: raise HTTPException(400,'Les quantités doivent être positives.')
+            p=c.execute('SELECT * FROM products WHERE id=? AND active=1',(it.product_id,)).fetchone()
+            if not p: raise HTTPException(400,f'Article {it.product_id} introuvable ou archivé.')
+            if float(p['stock'])+0.000001<float(it.qty): raise HTTPException(400,f'Stock insuffisant pour {p["name"]}. Disponible : {p["stock"]}.')
+            new_lines.append((it,p))
+        new_total=sum(float(it.qty)*float(p['price']) for it,p in new_lines)
+        paid=float(o['paid'] or 0)
+        if new_total+0.001<paid:
+            raise HTTPException(400,f'Le nouveau total ({new_total:.2f}) est inférieur au montant déjà encaissé ({paid:.2f}). Une procédure de remboursement est nécessaire avant cette correction.')
+        c.execute('DELETE FROM order_items WHERE order_id=?',(oid,))
+        for it,p in new_lines:
+            c.execute('INSERT INTO order_items(order_id,product_id,qty,unit_price,unit_cost,category) VALUES(?,?,?,?,?,?)',(oid,it.product_id,it.qty,p['price'],p['cost'],p['category'] or 'Autres'))
+            c.execute('UPDATE products SET stock=stock-? WHERE id=?',(it.qty,it.product_id))
+            c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(it.product_id,'sale',it.qty,f'Correction reçu payé #{oid}',now(),e['id']))
+        for it in old:
+            c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(it['product_id'],'return',it['qty'],f'Restitution avant correction reçu #{oid}',now(),e['id']))
+        new_status='paid' if abs(new_total-paid)<=0.001 else 'pending'
+        c.execute('UPDATE orders SET customer=?,status=? WHERE id=?',(x.customer, new_status, oid))
+        detail=f'Reçu #{oid}: total précédent remplacé; nouveau total={new_total:.2f}; déjà encaissé={paid:.2f}; statut={new_status}'
+        c.execute('INSERT INTO audit(employee_id,action,details,created) VALUES(?,?,?,?)',(e['id'],'CORRECTION_RECU_PAYE',detail,now()))
+        c.commit()
+        return {'ok':True,'id':oid,'new_total':new_total,'paid':paid,'remaining':max(0,new_total-paid),'status':new_status}
+    except HTTPException:
+        c.rollback(); raise
+    except Exception:
+        c.rollback(); raise
+    finally:
+        c.close()
+
 @app.post('/api/orders/{oid}/pay')
 def pay(oid:int,x:PayIn,authorization:Optional[str]=Header(None)):
     e=employee(authorization); allow(e,'admin','shareholder','cashier'); c=db(); o=c.execute("SELECT * FROM orders WHERE id=? AND status IN ('pending','served')",(oid,)).fetchone()
