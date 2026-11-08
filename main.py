@@ -146,7 +146,7 @@ def dashboard(authorization:Optional[str]=Header(None)):
     return {'products':dict(p),'open_orders':dict(o),'credits':cr['total'],'role':e['role']}
 @app.get('/api/order-products')
 def order_products(authorization:Optional[str]=Header(None)):
-    employee(authorization); c=db(); r=c.execute('SELECT id,name,category,price,stock FROM products WHERE active=1 AND stock>0 ORDER BY category,name').fetchall(); c.close(); return [dict(x) for x in r]
+    employee(authorization); c=db(); r=c.execute('SELECT id,name,category,price,stock FROM products WHERE active=1 ORDER BY category,name').fetchall(); c.close(); return [dict(x) for x in r]
 @app.get('/api/products')
 def products(authorization:Optional[str]=Header(None)):
     e=employee(authorization); allow(e,'admin','shareholder'); c=db(); r=c.execute('SELECT * FROM products WHERE active=1 ORDER BY category,name').fetchall(); c.close(); return [dict(x) for x in r]
@@ -256,7 +256,7 @@ def pay_credit(cid:int,x:CreditPay,authorization:Optional[str]=Header(None)):
 def receipt(oid:int,authorization:Optional[str]=Header(None)):
     employee(authorization); c=db(); o=c.execute('SELECT o.*,t.name table_name FROM orders o LEFT JOIN tables_room t ON t.id=o.table_id WHERE o.id=?',(oid,)).fetchone()
     if not o: c.close(); raise HTTPException(404,'Reçu introuvable')
-    items=[dict(x) for x in c.execute('SELECT i.*,p.name product_name FROM order_items i JOIN products p ON p.id=i.product_id WHERE i.order_id=?',(oid,))]; c.close(); return {'order':dict(o),'items':items,'total':sum(i['qty']*i['unit_price'] for i in items)}
+    items=[dict(x) for x in c.execute("SELECT i.*,COALESCE(p.name,'Article archivé') product_name FROM order_items i LEFT JOIN products p ON p.id=i.product_id WHERE i.order_id=?",(oid,))]; c.close(); return {'order':dict(o),'items':items,'total':sum(i['qty']*i['unit_price'] for i in items)}
 @app.post('/api/customer/{table_id}/order')
 def customer_order(table_id:int,x:OrderIn):
     oid=create_order(table_id,x.customer,x.items,'client',None,None); return {'id':oid,'message':'Commande transmise à la caisse.'}
@@ -315,6 +315,34 @@ def list_expenses(month:Optional[str]=None,authorization:Optional[str]=Header(No
     e=employee(authorization); admin_or_share(e); c=db(); q='SELECT * FROM expenses'; args=[]
     if month: q+=' WHERE substr(day,1,7)=?'; args=[month]
     r=c.execute(q+' ORDER BY day DESC,id DESC',args).fetchall(); c.close(); return [dict(x) for x in r]
+@app.get('/api/orders/history')
+def paid_order_history(period:str='day',anchor:Optional[str]=None,authorization:Optional[str]=Header(None)):
+    e=employee(authorization); allow(e,'admin','shareholder','cashier','service')
+    anchor=anchor or date.today().isoformat()
+    if period=='day': start=end=anchor
+    elif period=='week':
+        d=date.fromisoformat(anchor); start=(d-__import__('datetime').timedelta(days=d.weekday())).isoformat(); end=(date.fromisoformat(start)+__import__('datetime').timedelta(days=6)).isoformat()
+    elif period=='month': start=anchor[:7]+'-01'; end=anchor[:7]+'-'+str(monthrange(int(anchor[:4]),int(anchor[5:7]))[1])
+    elif period=='year': start=anchor[:4]+'-01-01'; end=anchor[:4]+'-12-31'
+    else: raise HTTPException(400,'Période invalide')
+    c=db()
+    rows=c.execute("""SELECT o.*,t.name table_name,
+        (SELECT COALESCE(SUM(i.qty*i.unit_price),0) FROM order_items i WHERE i.order_id=o.id) total,
+        (SELECT MAX(p.created) FROM payments p WHERE p.order_id=o.id) paid_at,
+        (SELECT COALESCE(SUM(p.amount),0) FROM payments p WHERE p.order_id=o.id) paid_total
+        FROM orders o LEFT JOIN tables_room t ON t.id=o.table_id
+        WHERE o.status='paid'
+        AND substr((SELECT MAX(p.created) FROM payments p WHERE p.order_id=o.id),1,10) BETWEEN ? AND ?
+        ORDER BY paid_at DESC""",(start,end)).fetchall()
+    out=[]
+    for row in rows:
+        item_rows=c.execute("SELECT i.*,COALESCE(p.name,'Article archivé') product_name FROM order_items i LEFT JOIN products p ON p.id=i.product_id WHERE i.order_id=? ORDER BY i.id",(row['id'],)).fetchall()
+        d=dict(row); d['items']=[dict(x) for x in item_rows]; out.append(d)
+    summary={'receipts':len(out),'sales':sum(x['total'] for x in out),'cost':sum(sum(i['qty']*i['unit_cost'] for i in x['items']) for x in out)}
+    c.close()
+    summary['gross_profit']=summary['sales']-summary['cost']
+    return {'period':period,'start':start,'end':end,'summary':summary,'receipts':out}
+
 @app.get('/api/reports')
 def reports(period:str='day',anchor:Optional[str]=None,authorization:Optional[str]=Header(None)):
     e=employee(authorization); admin_or_share(e); anchor=anchor or date.today().isoformat()

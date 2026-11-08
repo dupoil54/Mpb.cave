@@ -1,4 +1,14 @@
-# Cave de Tibati — Version 2.1 : données persistantes et coûts par catégorie
+# Cave de Tibati — Version 2.2 : panier visuel et historique des reçus
+
+
+## Nouveautés de l'interface 2.2
+
+- Les commandes sont maintenant créées et modifiées depuis une page unique avec catalogue visuel, recherche d'articles, boutons d'ajout, contrôle des quantités et panier récapitulatif. Les boîtes de dialogue successives pour choisir chaque article ont été supprimées.
+- Un reçu en attente peut être ouvert dans le panier pour augmenter ou diminuer les quantités, retirer un article ou en ajouter de nouveaux avant l'encaissement. Le stock est contrôlé à l'enregistrement.
+- L'onglet **Tables & reçus** contient un historique des reçus entièrement payés. Filtrage par jour, semaine, mois et année, avec total des ventes, coût d'achat, bénéfice brut et accès à chaque reçu.
+- Un rapport de la période filtrée peut être imprimé depuis cet historique.
+- Sur le tableau de bord, cliquer sur **Ruptures** affiche uniquement les articles dont le stock est nul ; cliquer sur **Alertes stock** affiche uniquement les articles dont le stock est positif mais inférieur ou égal au seuil d'alerte. Un bouton permet de revenir à la liste complète.
+- Les reçus historiques restent consultables même si un article a été archivé.
 
 ## Correctifs apportés
 
