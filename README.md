@@ -1,7 +1,12 @@
-# Cave de Tibati — Version 2.2 : panier visuel et historique des reçus
+# Cave de Tibati — Version 2.3 : panier unifié et stock par catégorie
 
 
-## Nouveautés de l'interface 2.2
+## Nouveautés de l’interface 2.3
+
+- La création d’une nouvelle commande et la modification d’un reçu en attente utilisent explicitement le même écran de panier visuel : catalogue d’articles, recherche, filtres par catégorie, ajout rapide, réglage des quantités, suppression et total recalculé. La création ne passe plus par une suite de listes ou boîtes de dialogue.
+- Dans **Gestion du stock**, les articles sont regroupés par catégorie, chaque catégorie affiche son nombre d’articles et la quantité totale en stock. Le regroupement reste actif lorsque le filtre « Ruptures » ou « Alertes stock » est utilisé.
+
+## Nouveautés conservées de l’interface 2.2
 
 - Les commandes sont maintenant créées et modifiées depuis une page unique avec catalogue visuel, recherche d'articles, boutons d'ajout, contrôle des quantités et panier récapitulatif. Les boîtes de dialogue successives pour choisir chaque article ont été supprimées.
 - Un reçu en attente peut être ouvert dans le panier pour augmenter ou diminuer les quantités, retirer un article ou en ajouter de nouveaux avant l'encaissement. Le stock est contrôlé à l'enregistrement.
