@@ -296,6 +296,24 @@ def update_employee(eid:int,x:EmployeeUpdate,authorization:Optional[str]=Header(
         if len(x.new_pin)<4 or not x.new_pin.isdigit(): c.close(); raise HTTPException(400,'PIN invalide')
         c.execute('UPDATE employees SET pin_hash=?,pin_changed=0 WHERE id=?',(hashpin(x.new_pin),eid))
     c.commit(); c.close(); log(e,'MODIFICATION_EMPLOYE',f'Employé #{eid}'); return {'ok':True}
+@app.delete('/api/employees/{eid}')
+def deactivate_employee(eid:int,authorization:Optional[str]=Header(None)):
+    # Suppression logique : l'historique des ventes, présences et journaux reste intact.
+    e=employee(authorization); admin_or_share(e)
+    if eid==e['id']:
+        raise HTTPException(400,'Vous ne pouvez pas supprimer votre propre compte connecté.')
+    c=db(); emp=c.execute('SELECT id,name,role,active FROM employees WHERE id=?',(eid,)).fetchone()
+    if not emp:
+        c.close(); raise HTTPException(404,'Employé introuvable')
+    if emp['role']=='admin' and emp['active']:
+        admins=c.execute("SELECT count(*) FROM employees WHERE role='admin' AND active=1").fetchone()[0]
+        if admins<=1:
+            c.close(); raise HTTPException(400,'Impossible de supprimer le dernier compte administrateur actif.')
+    c.execute('UPDATE employees SET active=0 WHERE id=?',(eid,))
+    c.execute('DELETE FROM sessions WHERE employee_id=?',(eid,))
+    c.commit(); c.close(); log(e,'COMPTE_EMPLOYE_DESACTIVE',f"{emp['name']} (#{eid})")
+    return {'ok':True,'message':'Compte désactivé. Son historique est conservé.'}
+
 @app.post('/api/attendance')
 def attendance(x:AttendanceIn,authorization:Optional[str]=Header(None)):
     e=employee(authorization); admin_or_share(e)

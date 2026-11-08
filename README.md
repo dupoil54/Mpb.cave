@@ -75,3 +75,28 @@ Les périodes disponibles restent : jour, semaine, mois et année. Le tableau «
 - Les anciens paiements enregistrés sous `Espèces` sont comptabilisés dans **Cash**. Les paiements anciens avec un mode non reconnu restent visibles dans « Autre / ancien mode ».
 
 Les deux modes autorisés pour les nouveaux encaissements sont `Cash` et `Paiement mobile`.
+
+## Version 2.5 — Comptes employés et impression Zonerich AB-320M
+
+### Gestion des comptes
+- L'administrateur et l'actionnaire peuvent modifier le nom, le poste, le salaire mensuel et réinitialiser le PIN initial d'un employé.
+- Le bouton « Supprimer » désactive le compte et révoque ses sessions. Il s'agit d'une suppression logique : ventes, reçus, présences et journaux historiques restent conservés.
+- Un compte désactivé peut être réactivé depuis la section « Comptes désactivés ».
+- L'application empêche la suppression du compte actuellement connecté et du dernier administrateur actif.
+
+### Impression des reçus — Zonerich AB-320M
+La photo correspond à une imprimante mobile thermique Zonerich AB-320M (ce n'est pas une imprimante laser). Elle utilise un rouleau thermique de 58 mm et une largeur d'impression utile d'environ 48 mm. La page de reçu est maintenant formatée pour ce format et ouvre la boîte d'impression Android/navigateur.
+
+Pour essayer l'impression :
+1. Allumer l'imprimante et activer le Bluetooth du téléphone Android.
+2. Associer « AB-320M » dans les paramètres Bluetooth du téléphone. Le manuel indique le code d'appairage usine `1234` (si ce code a été changé, utiliser le code défini sur l'imprimante).
+3. Installer/activer sur Android un service d'impression ou pilote compatible avec cette imprimante Bluetooth classique (Bluetooth 2.0 / liaison série). Le navigateur web ne peut pas, à lui seul, garantir une connexion directe au profil Bluetooth série de cette imprimante.
+4. Dans Cave de Tibati, ouvrir un reçu puis appuyer sur « Imprimer ». Dans la boîte d'impression Android, choisir le service/pilote et le format papier 58 mm si disponible.
+5. Faire un essai avec un reçu court et ajuster les marges à 0–3 mm si le pilote le permet.
+
+Si Android n'affiche aucun service compatible ou si l'imprimante n'apparaît pas dans la boîte d'impression, il faudra utiliser une application Android d'impression compatible avec les imprimantes thermiques Bluetooth SPP, ou développer une petite application Android compagnon qui transmet les commandes d'impression via Bluetooth classique. Une page web hébergée sur Render ne peut pas ouvrir directement un port Bluetooth série SPP standard depuis Chrome Android.
+
+### Contrôles effectués
+- Syntaxe Python (`py_compile`) et JavaScript (`node --check`).
+- Test API : création, modification, désactivation d'un compte et vérification de la conservation de l'enregistrement historique.
+- Test de garde : désactivation du dernier compte administrateur actif interdite.
