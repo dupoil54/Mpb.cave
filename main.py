@@ -63,6 +63,7 @@ def init():
     CREATE TABLE IF NOT EXISTS credits(id INTEGER PRIMARY KEY,customer TEXT,order_id INTEGER,amount REAL,balance REAL,created TEXT,note TEXT);
     CREATE TABLE IF NOT EXISTS credit_payments(id INTEGER PRIMARY KEY,credit_id INTEGER,amount REAL,created TEXT,employee_id INTEGER);
     CREATE TABLE IF NOT EXISTS movements(id INTEGER PRIMARY KEY,product_id INTEGER,kind TEXT,qty REAL,note TEXT,created TEXT,employee_id INTEGER);
+    CREATE TABLE IF NOT EXISTS stock_purchases(id INTEGER PRIMARY KEY,product_id INTEGER NOT NULL,packs REAL NOT NULL,units_per_pack REAL NOT NULL,total_units REAL NOT NULL,purchase_price_per_pack REAL NOT NULL,total_cost REAL NOT NULL,unit_cost REAL NOT NULL,note TEXT DEFAULT '',created TEXT NOT NULL,employee_id INTEGER,FOREIGN KEY(product_id) REFERENCES products(id));
     CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,employee_id INTEGER,action TEXT,details TEXT,created TEXT);
     CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY,value TEXT);
     CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY,employee_id INTEGER,day TEXT,status TEXT DEFAULT 'present',approved INTEGER DEFAULT 0,approved_by INTEGER,created TEXT,UNIQUE(employee_id,day));
@@ -70,6 +71,7 @@ def init():
     ''')
     # migrations non destructives
     if 'method' not in cols(c,'credit_payments'): c.execute("ALTER TABLE credit_payments ADD COLUMN method TEXT DEFAULT 'Cash'")
+    if 'image_url' not in cols(c,'products'): c.execute("ALTER TABLE products ADD COLUMN image_url TEXT DEFAULT ''")
     # Conserver la catégorie au moment de la vente : les anciens rapports restent exacts
     # même si le nom ou la catégorie de l'article est modifié ultérieurement.
     if 'category' not in cols(c,'order_items'):
@@ -104,7 +106,7 @@ class Login(BaseModel): pin:str; role:str
 class PinChange(BaseModel): old_pin:str; new_pin:str
 class EmployeeIn(BaseModel): name:str; role:str; pin:str; monthly_salary:float=0
 class EmployeeUpdate(BaseModel): name:Optional[str]=None; role:Optional[str]=None; monthly_salary:Optional[float]=None; active:Optional[bool]=None; new_pin:Optional[str]=None
-class ProductIn(BaseModel): name:str; stock:float; code:Optional[str]=None; category:str='Autres'; supplier:str=''; cost:float=0; price:float=0; alert:float=5; target:float=20
+class ProductIn(BaseModel): name:str; stock:float; code:Optional[str]=None; category:str='Autres'; supplier:str=''; cost:float=0; price:float=0; alert:float=5; target:float=20; image_url:str=''
 class TableIn(BaseModel): name:str
 class ItemIn(BaseModel): product_id:int; qty:float
 class OrderIn(BaseModel): table_id:Optional[int]=None; customer:str='Client'; items:List[ItemIn]; source:str='staff'
@@ -116,6 +118,7 @@ def normalize_payment_method(method):
     raise HTTPException(400,"Mode de paiement invalide. Choisissez Cash ou Paiement mobile.")
 class CreditPay(BaseModel): amount:float; method:str='Cash'
 class MoveIn(BaseModel): product_id:int; qty:float; kind:str='in'; note:str=''
+class WholesalePurchaseIn(BaseModel): product_id:int; packs:float; units_per_pack:float; purchase_price_per_pack:float; note:str=''
 class AttendanceIn(BaseModel): employee_id:int; day:str; status:str='present'
 class ExpenseIn(BaseModel): label:str; amount:float; category:str='Autres'; day:str; note:str=''
 @app.get('/')
@@ -152,7 +155,7 @@ def dashboard(authorization:Optional[str]=Header(None)):
     return {'products':dict(p),'open_orders':dict(o),'credits':cr['total'],'role':e['role']}
 @app.get('/api/order-products')
 def order_products(authorization:Optional[str]=Header(None)):
-    employee(authorization); c=db(); r=c.execute('SELECT id,name,category,price,stock FROM products WHERE active=1 ORDER BY category,name').fetchall(); c.close(); return [dict(x) for x in r]
+    employee(authorization); c=db(); r=c.execute('SELECT id,name,category,price,stock,image_url FROM products WHERE active=1 ORDER BY category,name').fetchall(); c.close(); return [dict(x) for x in r]
 @app.get('/api/products')
 def products(authorization:Optional[str]=Header(None)):
     e=employee(authorization); allow(e,'admin','shareholder'); c=db(); r=c.execute('SELECT * FROM products WHERE active=1 ORDER BY category,name').fetchall(); c.close(); return [dict(x) for x in r]
@@ -162,16 +165,17 @@ def add_product(x:ProductIn,authorization:Optional[str]=Header(None)):
     if not name or x.stock<0 or x.cost<0 or x.price<0: raise HTTPException(400,'Vérifie le libellé, la quantité et les prix.')
     code=(x.code or '').strip() or ('ART-'+secrets.token_hex(3).upper()); c=db()
     try:
-        cur=c.execute('INSERT INTO products(code,name,category,supplier,cost,price,stock,alert,target) VALUES(?,?,?,?,?,?,?,?,?)',(code,name,x.category.strip() or 'Autres',x.supplier.strip(),x.cost,x.price,x.stock,x.alert,x.target)); pid=cur.lastrowid
+        cur=c.execute('INSERT INTO products(code,name,category,supplier,cost,price,stock,alert,target,image_url) VALUES(?,?,?,?,?,?,?,?,?,?)',(code,name,x.category.strip() or 'Autres',x.supplier.strip(),x.cost,x.price,x.stock,x.alert,x.target,x.image_url.strip())); pid=cur.lastrowid
         if x.stock>0: c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(pid,'in',x.stock,'Stock initial',now(),e['id']))
     except sqlite3.IntegrityError: c.close(); raise HTTPException(409,'Code article déjà utilisé')
     c.commit(); c.close(); log(e,'CREATION_ARTICLE',name); return {'id':pid,'code':code}
 @app.patch('/api/products/{pid}')
 def update_product(pid:int,x:dict,authorization:Optional[str]=Header(None)):
-    e=employee(authorization); admin_or_share(e); name=str(x.get('name','')).strip()
-    if not name: raise HTTPException(400,'Libellé obligatoire')
-    c=db(); cur=c.execute('UPDATE products SET name=? WHERE id=? AND active=1',(name,pid)); c.commit(); c.close()
-    if not cur.rowcount: raise HTTPException(404,'Article introuvable')
+    e=employee(authorization); admin_or_share(e); c=db(); row=c.execute('SELECT * FROM products WHERE id=? AND active=1',(pid,)).fetchone()
+    if not row: c.close(); raise HTTPException(404,'Article introuvable')
+    name=str(x.get('name',row['name'])).strip(); image_url=str(x.get('image_url',row['image_url'] or '')).strip()
+    if not name: c.close(); raise HTTPException(400,'Libellé obligatoire')
+    c.execute('UPDATE products SET name=?,image_url=? WHERE id=? AND active=1',(name,image_url,pid)); c.commit(); c.close()
     log(e,'MODIFICATION_ARTICLE',name); return {'ok':True}
 @app.delete('/api/products/{pid}')
 def archive_product(pid:int,authorization:Optional[str]=Header(None)):
@@ -187,6 +191,41 @@ def movement(x:MoveIn,authorization:Optional[str]=Header(None)):
     delta=x.qty if x.kind=='in' else (-x.qty if x.kind=='out' else x.qty-p['stock'])
     if p['stock']+delta<0: c.close(); raise HTTPException(400,'Stock insuffisant')
     c.execute('UPDATE products SET stock=stock+? WHERE id=?',(delta,x.product_id)); c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(x.product_id,x.kind,x.qty,x.note,now(),e['id'])); c.commit(); c.close(); log(e,'MOUVEMENT_STOCK',f"{p['name']} {x.kind} {x.qty}"); return {'ok':True}
+@app.get('/api/wholesale-purchases')
+def wholesale_purchases(authorization:Optional[str]=Header(None)):
+    e=employee(authorization); admin_or_share(e); c=db()
+    rows=c.execute("SELECT s.*,p.name product_name FROM stock_purchases s JOIN products p ON p.id=s.product_id ORDER BY s.id DESC LIMIT 100").fetchall()
+    c.close(); return [dict(x) for x in rows]
+
+@app.post('/api/wholesale-purchases')
+def add_wholesale_purchase(x:WholesalePurchaseIn,authorization:Optional[str]=Header(None)):
+    e=employee(authorization); admin_or_share(e)
+    if x.packs<=0 or x.units_per_pack<=0 or x.purchase_price_per_pack<0:
+        raise HTTPException(400,'Le nombre de cartons, les unités par carton et le prix d’achat doivent être valides.')
+    total_units=float(x.packs)*float(x.units_per_pack)
+    total_cost=float(x.packs)*float(x.purchase_price_per_pack)
+    incoming_unit_cost=total_cost/total_units
+    c=db()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        product=c.execute('SELECT * FROM products WHERE id=? AND active=1',(x.product_id,)).fetchone()
+        if not product: raise HTTPException(404,'Article introuvable ou archivé.')
+        old_qty=float(product['stock'] or 0); old_cost=float(product['cost'] or 0)
+        # Coût moyen pondéré : les unités restantes + le nouvel arrivage.
+        weighted_cost=((old_qty*old_cost)+total_cost)/(old_qty+total_units) if old_qty+total_units else incoming_unit_cost
+        c.execute('UPDATE products SET stock=stock+?,cost=? WHERE id=?',(total_units,weighted_cost,x.product_id))
+        cur=c.execute('INSERT INTO stock_purchases(product_id,packs,units_per_pack,total_units,purchase_price_per_pack,total_cost,unit_cost,note,created,employee_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+            (x.product_id,x.packs,x.units_per_pack,total_units,x.purchase_price_per_pack,total_cost,incoming_unit_cost,x.note.strip(),now(),e['id']))
+        c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',
+            (x.product_id,'in',total_units,f'Achat en gros #{cur.lastrowid} : {x.packs:g} colis × {x.units_per_pack:g} unités',now(),e['id']))
+        c.commit()
+    except HTTPException:
+        c.rollback(); c.close(); raise
+    except Exception:
+        c.rollback(); c.close(); raise
+    c.close(); log(e,'ACHAT_STOCK_GROS',f"{product['name']} : {x.packs:g} colis, {total_units:g} unités, coût total {total_cost:.0f} FCFA, coût unitaire moyen {weighted_cost:.2f} FCFA")
+    return {'ok':True,'purchase_id':cur.lastrowid,'total_units':total_units,'total_cost':total_cost,'incoming_unit_cost':incoming_unit_cost,'weighted_unit_cost':weighted_cost,'new_stock':old_qty+total_units}
+
 @app.get('/api/tables')
 def tables(authorization:Optional[str]=Header(None)):
     employee(authorization); c=db(); r=c.execute("SELECT t.*,count(o.id) orders FROM tables_room t LEFT JOIN orders o ON o.table_id=t.id AND o.status IN ('pending','served') WHERE t.active=1 GROUP BY t.id ORDER BY t.id").fetchall(); c.close(); return [dict(x) for x in r]
@@ -319,7 +358,7 @@ def customer_order(table_id:int,x:OrderIn):
 def public_menu(table_id:int):
     c=db(); t=c.execute('SELECT * FROM tables_room WHERE id=? AND active=1',(table_id,)).fetchone()
     if not t: c.close(); raise HTTPException(404,'Table inconnue')
-    ps=c.execute('SELECT id,name,category,price FROM products WHERE active=1 AND stock>0 ORDER BY category,name').fetchall(); c.close(); return {'table':dict(t),'products':[dict(x) for x in ps]}
+    ps=c.execute('SELECT id,name,category,price,image_url FROM products WHERE active=1 AND stock>0 ORDER BY category,name').fetchall(); c.close(); return {'table':dict(t),'products':[dict(x) for x in ps]}
 @app.get('/api/employees')
 def list_employees(authorization:Optional[str]=Header(None)):
     e=employee(authorization); admin_or_share(e); c=db(); r=c.execute('SELECT id,name,role,active,monthly_salary,pin_changed FROM employees ORDER BY name').fetchall(); c.close(); return [dict(x) for x in r]
@@ -465,6 +504,28 @@ def storage_status(authorization:Optional[str]=Header(None)):
     c.close()
     size=os.path.getsize(DB) if os.path.exists(DB) else 0
     return {'database_file':os.path.basename(DB),'database_size_bytes':size,'persistent_path':DB.startswith('/var/data/'),'tables':counts,'backup_directory':BACKUP_DIR}
+
+@app.post('/api/admin/reset-data')
+def reset_data(payload:dict,authorization:Optional[str]=Header(None)):
+    e=employee(authorization); allow(e,'admin')
+    if payload.get('confirmation') != 'VIDER TOUT':
+        raise HTTPException(400,'Confirmation incorrecte. Saisissez exactement VIDER TOUT.')
+    # Sauvegarde automatique avant toute suppression irréversible.
+    os.makedirs(BACKUP_DIR,exist_ok=True)
+    stamp=datetime.now().strftime('%Y%m%d_%H%M%S')
+    target=os.path.join(BACKUP_DIR,f'cave_tibati_avant_reinitialisation_{stamp}.db')
+    src=sqlite3.connect(DB,timeout=30); dst=sqlite3.connect(target)
+    try: src.backup(dst)
+    finally: dst.close(); src.close()
+    c=db()
+    # On conserve les employés, leurs PIN, les sessions, les paramètres et la structure SQL.
+    # Les tables opérationnelles sont vidées, y compris produits, ventes, stocks, tables et historique.
+    for table in ('credit_payments','credits','payments','order_items','orders','movements','stock_purchases','attendance','expenses','audit','tables_room','products'):
+        c.execute(f'DELETE FROM {table}')
+    # Réinitialiser les compteurs des tables de données vidées sans toucher aux employés.
+    c.commit(); c.close()
+    log(e,'REINITIALISATION_DONNEES','Données opérationnelles vidées; comptes employés et accès conservés. Sauvegarde: '+os.path.basename(target))
+    return {'ok':True,'backup':os.path.basename(target),'message':'Données réinitialisées. Les comptes et PIN des employés sont conservés.'}
 
 @app.post('/api/admin/backup')
 def create_backup(authorization:Optional[str]=Header(None)):
