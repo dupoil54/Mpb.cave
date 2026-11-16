@@ -1,10 +1,8 @@
 # Cave de Tibati – version catalogue caisse + réinitialisation sécurisée
 
 ## Nouveautés
-- Catalogue de produits en vignettes avec photo, nom, catégorie, prix et stock.
-- Interface de prise de commande / caisse avec vignettes photos.
-- Catalogue client avec photos des articles.
-- Chaque produit accepte une URL d'image (HTTPS conseillé), saisie lors de la création ou de la modification de l'article.
+- Catalogue de produits en vignettes : nom, catégorie, prix et stock.
+- Interface de prise de commande / caisse en vignettes.
 - Migration SQLite non destructive : ajout de `products.image_url` uniquement si la colonne n'existe pas. Les tables et colonnes existantes sont conservées.
 - Bouton « Vider toutes les données » visible uniquement pour l'administrateur, dans Ventes & bénéfices > Conservation des données.
 - La réinitialisation crée automatiquement une sauvegarde avant suppression. Elle vide les produits/stocks, tables, commandes, lignes de vente, paiements, ardoises, mouvements, présences, charges et journal. Elle conserve les comptes employés, leurs PIN, les sessions, les paramètres et toute la structure SQL.
@@ -15,8 +13,8 @@
 3. Ne pas supprimer le fichier `cave.db` du disque persistant et ne pas recréer une base vide en production.
 4. Redéployer le service. La migration ajoute automatiquement la colonne image sans effacer les données existantes.
 
-## Ajouter les photos des produits
-Dans Gestion du stock > Nouvel article, renseigner le champ « Lien image (URL) facultatif ». Pour un article déjà créé, cliquer sur « Modifier » et saisir le lien de sa photo. Les URL publiques HTTPS sont recommandées. Si aucun lien n'est renseigné, la vignette reste neutre ou masquée selon l'écran.
+## Photos (supprimées en v2.11)
+L'application ne demande plus de photo ni de lien image : ni à la création d'un article, ni à la modification, ni dans la caisse. La colonne `products.image_url` reste dans la base (valeur vide) pour ne rien détruire ; elle n'est simplement plus utilisée.
 
 ## Réinitialiser les données
 Se connecter avec le rôle Administrateur, ouvrir Ventes & bénéfices, puis la section Conservation des données. Cliquer sur « Vider toutes les données », saisir exactement `VIDER TOUT`, puis confirmer. Une sauvegarde `.db` est créée dans le dossier `backups` avant le nettoyage. Les accès administrateur et les comptes des employés sont conservés.
