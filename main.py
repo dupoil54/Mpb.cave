@@ -1,4 +1,4 @@
-import os, sqlite3, hashlib, secrets, shutil
+import os, re, sqlite3, hashlib, secrets, shutil, unicodedata
 from datetime import datetime, date
 from calendar import monthrange
 from fastapi import FastAPI, HTTPException, Header
@@ -148,11 +148,15 @@ def logout(authorization:Optional[str]=Header(None)):
     e=employee(authorization); c=db(); c.execute('DELETE FROM sessions WHERE token=?',(authorization,)); c.commit(); c.close(); log(e,'DECONNEXION'); return {'ok':True}
 @app.get('/api/dashboard')
 def dashboard(authorization:Optional[str]=Header(None)):
-    e=employee(authorization); c=db(); p=c.execute('SELECT count(*) n,sum(CASE WHEN stock<=0 THEN 1 ELSE 0 END) ruptures,sum(CASE WHEN stock>0 AND stock<=alert THEN 1 ELSE 0 END) alertes,sum(stock*cost) valeur FROM products WHERE active=1').fetchone()
+    e=employee(authorization); c=db(); p=c.execute('SELECT count(*) n,sum(CASE WHEN stock<=0 THEN 1 ELSE 0 END) ruptures,sum(CASE WHEN stock>0 AND stock<=alert THEN 1 ELSE 0 END) alertes,sum(stock*cost) valeur,sum(stock*price) valeur_vente FROM products WHERE active=1').fetchone()
     o=c.execute("SELECT count(*) n,coalesce(sum((SELECT sum(qty*unit_price) FROM order_items i WHERE i.order_id=o.id)),0) total FROM orders o WHERE o.status IN ('pending','served')").fetchone(); cr=c.execute('SELECT coalesce(sum(balance),0) total FROM credits WHERE balance>0').fetchone(); c.close()
     if e['role'] not in ALL:
         return {'open_orders':dict(o),'credits':cr['total'] if e['role']=='cashier' else 0,'role':e['role']}
-    return {'products':dict(p),'open_orders':dict(o),'credits':cr['total'],'role':e['role']}
+    # Chiffre d'affaires : même définition que les rapports (commandes payées ou à crédit).
+    today=date.today().isoformat(); c=db()
+    def ca(start,end): return c.execute("SELECT coalesce(sum(i.qty*i.unit_price),0) v FROM order_items i JOIN orders o ON o.id=i.order_id WHERE o.status IN ('paid','credit') AND substr(o.created,1,10) BETWEEN ? AND ?",(start,end)).fetchone()['v']
+    revenue={'day':ca(today,today),'month':ca(today[:7]+'-01',today[:7]+'-31'),'year':ca(today[:4]+'-01-01',today[:4]+'-12-31')}; c.close()
+    return {'products':dict(p),'open_orders':dict(o),'credits':cr['total'],'revenue':revenue,'role':e['role']}
 @app.get('/api/order-products')
 def order_products(authorization:Optional[str]=Header(None)):
     employee(authorization); c=db(); r=c.execute('SELECT id,name,category,price,stock,image_url FROM products WHERE active=1 ORDER BY category,name').fetchall(); c.close(); return [dict(x) for x in r]
@@ -275,7 +279,7 @@ def edit_order(oid:int,x:OrderIn,authorization:Optional[str]=Header(None)):
 @app.patch('/api/orders/{oid}/edit-paid')
 def edit_paid_order(oid:int,x:OrderIn,authorization:Optional[str]=Header(None)):
     """Corrige un reçu payé : stock compensé et lignes comptables remplacées."""
-    e=employee(authorization); admin_or_share(e)
+    e=employee(authorization); allow(e,'admin','shareholder','cashier')
     if not x.items: raise HTTPException(400,'Le panier doit contenir au moins un article.')
     c=db()
     try:
@@ -338,7 +342,16 @@ def credit(oid:int,authorization:Optional[str]=Header(None)):
     c.execute('INSERT INTO credits(customer,order_id,amount,balance,created,note) VALUES(?,?,?,?,?,?)',(o['customer'],oid,amount,amount,now(),'Ardoise depuis reçu')); c.execute("UPDATE orders SET credit=credit+?,status='credit' WHERE id=?",(amount,oid)); c.commit(); c.close(); log(e,'MISE_A_CREDIT',f'Commande #{oid}: {amount}'); return {'credit':amount}
 @app.get('/api/credits')
 def credits(authorization:Optional[str]=Header(None)):
-    e=employee(authorization); allow(e,'admin','shareholder','cashier'); c=db(); r=c.execute('SELECT * FROM credits WHERE balance>0 ORDER BY created DESC').fetchall(); c.close(); return [dict(x) for x in r]
+    e=employee(authorization); allow(e,'admin','shareholder','cashier'); c=db(); rows=c.execute('SELECT * FROM credits WHERE balance>0 ORDER BY created DESC').fetchall(); out=[]
+    for x in rows:
+        d=dict(x); oid=d.get('order_id'); d['items']=[]; d['order_total']=0; d['table_name']=None; d['order_created']=None
+        if oid:
+            d['items']=[dict(i) for i in c.execute("SELECT i.qty,i.unit_price,COALESCE(p.name,'Article archivé') product_name FROM order_items i LEFT JOIN products p ON p.id=i.product_id WHERE i.order_id=? ORDER BY i.id",(oid,))]
+            d['order_total']=sum(i['qty']*i['unit_price'] for i in d['items'])
+            o=c.execute('SELECT o.created,t.name table_name FROM orders o LEFT JOIN tables_room t ON t.id=o.table_id WHERE o.id=?',(oid,)).fetchone()
+            if o: d['table_name']=o['table_name']; d['order_created']=o['created']
+        out.append(d)
+    c.close(); return out
 @app.post('/api/credits/{cid}/pay')
 def pay_credit(cid:int,x:CreditPay,authorization:Optional[str]=Header(None)):
     e=employee(authorization); allow(e,'admin','shareholder','cashier'); c=db(); cr=c.execute('SELECT * FROM credits WHERE id=?',(cid,)).fetchone()
@@ -455,6 +468,10 @@ def paid_order_history(period:str='day',anchor:Optional[str]=None,authorization:
     summary['gross_profit']=summary['sales']-summary['cost']
     return {'period':period,'start':start,'end':end,'summary':summary,'receipts':out}
 
+def _norm(s): return ''.join(ch for ch in unicodedata.normalize('NFD',(s or '').lower()) if unicodedata.category(ch)!='Mn')
+GROUP_VINS=re.compile(r'\b(vins?|whisk\w*|cognacs?|champagnes?|verm\w*|gins?|mousseux)\b')
+GROUP_LABELS={'spiritueux':'Vins & spiritueux','boissons':'Bières, jus & eau'}
+def category_group(cat): return 'spiritueux' if GROUP_VINS.search(_norm(cat)) else 'boissons'
 @app.get('/api/reports')
 def reports(period:str='day',anchor:Optional[str]=None,authorization:Optional[str]=Header(None)):
     e=employee(authorization); admin_or_share(e); anchor=anchor or date.today().isoformat()
@@ -487,9 +504,31 @@ def reports(period:str='day',anchor:Optional[str]=None,authorization:Optional[st
     mobile_received=payment_breakdown.get('Paiement mobile',0)
     other_received=payment_breakdown.get('Autre / ancien mode',0)
     total_received=cash_received+mobile_received+other_received
+    # Bénéfice réalisé : pour chaque encaissement (reçus et règlements d'ardoises), on retient
+    # la part de marge du reçu correspondant, au prorata de la somme réellement encaissée.
+    pay_rows=c.execute("""SELECT order_id, SUM(amount) amount FROM (
+        SELECT order_id, amount, created FROM payments
+        UNION ALL
+        SELECT cr.order_id order_id, cp.amount amount, cp.created created FROM credit_payments cp JOIN credits cr ON cr.id=cp.credit_id
+    ) WHERE substr(created,1,10) BETWEEN ? AND ? GROUP BY order_id""",(start,end)).fetchall()
+    realized_profit=0.0
+    for pr in pay_rows:
+        if pr['order_id'] is None: continue
+        t=c.execute('SELECT COALESCE(SUM(qty*unit_price),0) s,COALESCE(SUM(qty*unit_cost),0) k FROM order_items WHERE order_id=?',(pr['order_id'],)).fetchone()
+        if t['s']>0: realized_profit+=float(pr['amount'])*(t['s']-t['k'])/t['s']
     c.close()
+    groups={k:{'key':k,'label':GROUP_LABELS[k],'sales':0,'cost':0,'gross_profit':0,'quantity':0,'categories':[]} for k in ('spiritueux','boissons')}
+    for r in categories:
+        g=groups[category_group(r['category'])]; g['sales']+=r['sales']; g['cost']+=r['cost']; g['gross_profit']+=r['gross_profit']; g['quantity']+=r['quantity']; g['categories'].append(r['category'])
     gross=sales-cost
-    return {'period':period,'start':start,'end':end,'sales':sales,'cost_of_goods':cost,'gross_profit':gross,'expenses':expenses,'net_estimate':gross-expenses,'orders':count,'by_category':[dict(x) for x in categories], 'cash_received':cash_received, 'mobile_received':mobile_received, 'other_received':other_received, 'total_received':total_received, 'payments_by_method':payment_breakdown}
+    return {'period':period,'start':start,'end':end,'sales':sales,'cost_of_goods':cost,'gross_profit':gross,'expenses':expenses,'net_estimate':gross-expenses,'orders':count,'by_category':[dict(x) for x in categories], 'cash_received':cash_received, 'mobile_received':mobile_received, 'other_received':other_received, 'total_received':total_received, 'realized_profit':realized_profit, 'groups':list(groups.values()), 'payments_by_method':payment_breakdown}
+@app.get('/api/reports/category-detail')
+def report_category_detail(start:str,end:str,category:str,authorization:Optional[str]=Header(None)):
+    e=employee(authorization); admin_or_share(e)
+    try: date.fromisoformat(start); date.fromisoformat(end)
+    except ValueError: raise HTTPException(400,'Dates invalides')
+    c=db(); rows=c.execute("SELECT i.product_id, COALESCE(p.name,'Article archivé') name, SUM(i.qty) quantity, SUM(i.qty*i.unit_price) sales, SUM(i.qty*i.unit_cost) cost, SUM(i.qty*(i.unit_price-i.unit_cost)) gross_profit FROM order_items i JOIN orders o ON o.id=i.order_id LEFT JOIN products p ON p.id=i.product_id WHERE o.status IN ('paid','credit') AND substr(o.created,1,10) BETWEEN ? AND ? AND COALESCE(NULLIF(i.category,''),'Autres')=? GROUP BY i.product_id ORDER BY sales DESC",(start,end,category)).fetchall(); c.close()
+    return {'category':category,'start':start,'end':end,'products':[dict(r) for r in rows]}
 @app.get('/api/audit')
 def audit(authorization:Optional[str]=Header(None)):
     e=employee(authorization); allow(e,'admin','shareholder','cashier'); c=db(); r=c.execute('SELECT a.*,e.name employee FROM audit a LEFT JOIN employees e ON e.id=a.employee_id ORDER BY a.id DESC LIMIT 300').fetchall(); c.close(); return [dict(x) for x in r]

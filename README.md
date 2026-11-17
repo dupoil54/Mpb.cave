@@ -13,7 +13,7 @@
 3. Ne pas supprimer le fichier `cave.db` du disque persistant et ne pas recréer une base vide en production.
 4. Redéployer le service. La migration ajoute automatiquement la colonne image sans effacer les données existantes.
 
-## Photos (supprimées en v2.11)
+## Photos (supprimées en v2.11) et chiffre d’affaires (tableau de bord)
 L'application ne demande plus de photo ni de lien image : ni à la création d'un article, ni à la modification, ni dans la caisse. La colonne `products.image_url` reste dans la base (valeur vide) pour ne rien détruire ; elle n'est simplement plus utilisée.
 
 ## Réinitialiser les données
@@ -25,3 +25,13 @@ Se connecter avec le rôle Administrateur, ouvrir Ventes & bénéfices, puis la 
 ## Approvisionnement en stock de gros (v2.10)
 
 Dans Gestion du stock, les profils Administrateur et Actionnaire peuvent enregistrer un achat par carton, pack ou caisse : article, nombre de colis, unités par colis et prix d'achat par colis. L'application calcule les unités entrantes, le coût total et le coût d'achat unitaire. Le coût unitaire du produit est ensuite actualisé par coût moyen pondéré (stock restant valorisé à l'ancien coût + nouvel achat), puis figé sur chaque nouvelle ligne de vente pour alimenter les rapports de coût et de bénéfice. L'historique des 100 derniers achats en gros est consultable dans la page Stock. La migration ajoute uniquement la table `stock_purchases` et ne supprime ni ne recrée les tables existantes.
+
+## Tableau de bord
+Le tableau de bord affiche le chiffre d’affaires du jour, du mois et de l’année (commandes payées ou à crédit, comme dans les rapports). Visible par l’administrateur et l’actionnaire.
+
+## Version 2.14
+- Tableau de bord : valeur du stock au prix d’achat et au prix de vente potentiel.
+- Ventes & bénéfices : ligne « Bénéfice réalisé sur les sommes encaissées » (au prorata de la marge de chaque reçu), totaux par groupe (Vins & spiritueux / Bières, jus & eau) et catégories cliquables pour voir le détail des produits vendus.
+- Stock : mouvements sélectionnés par catégorie puis par article ; marge bénéficiaire (%) sur chaque carte d’article.
+- Caisse : peut corriger un reçu payé (hors reçus liés à une ardoise).
+- Ardoises : la facture d’origine s’affiche dans la fenêtre de règlement.
