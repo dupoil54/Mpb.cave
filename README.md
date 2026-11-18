@@ -35,3 +35,8 @@ Le tableau de bord affiche le chiffre d’affaires du jour, du mois et de l’an
 - Stock : mouvements sélectionnés par catégorie puis par article ; marge bénéficiaire (%) sur chaque carte d’article.
 - Caisse : peut corriger un reçu payé (hors reçus liés à une ardoise).
 - Ardoises : la facture d’origine s’affiche dans la fenêtre de règlement.
+
+## Version 2.15
+- Seuils d'alerte configurables par article (bouton « Seuils » : seuil minimum, stock cible, fournisseur).
+- Bons de commande automatiques : dès qu'un article atteint son seuil minimum, il est ajouté à un bon (un par fournisseur) avec la quantité pour retrouver le stock cible et le prix d'achat enregistré. Quantités modifiables, impression, suivi À commander / Commandé / Reçu.
+- Fidélité client : numéro du client saisi sur le reçu, points à chaque encaissement (reçus et règlements d'ardoises), réduction automatique au palier. Règles réglables dans la page « Fidélité » (par défaut : 1 point pour 1 000 FCFA, palier de 100 points, réduction de 5 %).

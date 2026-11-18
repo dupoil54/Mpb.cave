@@ -1,4 +1,4 @@
-import os, re, sqlite3, hashlib, secrets, shutil, unicodedata
+import os, re, math, sqlite3, hashlib, secrets, shutil, unicodedata
 from datetime import datetime, date
 from calendar import monthrange
 from fastapi import FastAPI, HTTPException, Header
@@ -68,6 +68,9 @@ def init():
     CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY,value TEXT);
     CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY,employee_id INTEGER,day TEXT,status TEXT DEFAULT 'present',approved INTEGER DEFAULT 0,approved_by INTEGER,created TEXT,UNIQUE(employee_id,day));
     CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY,label TEXT,amount REAL,category TEXT,day TEXT,note TEXT,employee_id INTEGER,created TEXT);
+    CREATE TABLE IF NOT EXISTS customers(id INTEGER PRIMARY KEY,phone TEXT UNIQUE NOT NULL,name TEXT DEFAULT '',points REAL DEFAULT 0,total_spent REAL DEFAULT 0,created TEXT);
+    CREATE TABLE IF NOT EXISTS purchase_orders(id INTEGER PRIMARY KEY,supplier TEXT DEFAULT '',status TEXT DEFAULT 'draft',created TEXT,updated TEXT,note TEXT DEFAULT '');
+    CREATE TABLE IF NOT EXISTS purchase_order_items(id INTEGER PRIMARY KEY,po_id INTEGER NOT NULL,product_id INTEGER NOT NULL,qty REAL NOT NULL,unit_cost REAL NOT NULL,FOREIGN KEY(po_id) REFERENCES purchase_orders(id),FOREIGN KEY(product_id) REFERENCES products(id));
     ''')
     # migrations non destructives
     if 'method' not in cols(c,'credit_payments'): c.execute("ALTER TABLE credit_payments ADD COLUMN method TEXT DEFAULT 'Cash'")
@@ -77,6 +80,9 @@ def init():
     if 'category' not in cols(c,'order_items'):
         c.execute("ALTER TABLE order_items ADD COLUMN category TEXT DEFAULT 'Autres'")
         c.execute("UPDATE order_items SET category=COALESCE((SELECT NULLIF(p.category,'') FROM products p WHERE p.id=order_items.product_id),'Autres')")
+    oc=cols(c,'orders')
+    for col,ddl in (('customer_id','INTEGER'),('discount_pct','REAL DEFAULT 0'),('discount_amount','REAL DEFAULT 0'),('points_earned','REAL DEFAULT 0')):
+        if col not in oc: c.execute(f'ALTER TABLE orders ADD COLUMN {col} {ddl}')
     ec=cols(c,'employees')
     if 'pin_changed' not in ec: c.execute('ALTER TABLE employees ADD COLUMN pin_changed INTEGER DEFAULT 0')
     if 'monthly_salary' not in ec: c.execute('ALTER TABLE employees ADD COLUMN monthly_salary REAL DEFAULT 0')
@@ -109,7 +115,7 @@ class EmployeeUpdate(BaseModel): name:Optional[str]=None; role:Optional[str]=Non
 class ProductIn(BaseModel): name:str; stock:float; code:Optional[str]=None; category:str='Autres'; supplier:str=''; cost:float=0; price:float=0; alert:float=5; target:float=20; image_url:str=''
 class TableIn(BaseModel): name:str
 class ItemIn(BaseModel): product_id:int; qty:float
-class OrderIn(BaseModel): table_id:Optional[int]=None; customer:str='Client'; items:List[ItemIn]; source:str='staff'
+class OrderIn(BaseModel): table_id:Optional[int]=None; customer:str='Client'; items:List[ItemIn]; source:str='staff'; customer_phone:str=''
 class PayIn(BaseModel): amount:float; method:str='Cash'
 def normalize_payment_method(method):
     value=(method or '').strip().lower()
@@ -155,8 +161,9 @@ def dashboard(authorization:Optional[str]=Header(None)):
     # Chiffre d'affaires : même définition que les rapports (commandes payées ou à crédit).
     today=date.today().isoformat(); c=db()
     def ca(start,end): return c.execute("SELECT coalesce(sum(i.qty*i.unit_price),0) v FROM order_items i JOIN orders o ON o.id=i.order_id WHERE o.status IN ('paid','credit') AND substr(o.created,1,10) BETWEEN ? AND ?",(start,end)).fetchone()['v']
+    sync_purchase_orders(c); c.commit(); po_drafts=c.execute("SELECT count(*) n FROM purchase_orders WHERE status='draft'").fetchone()['n']
     revenue={'day':ca(today,today),'month':ca(today[:7]+'-01',today[:7]+'-31'),'year':ca(today[:4]+'-01-01',today[:4]+'-12-31')}; c.close()
-    return {'products':dict(p),'open_orders':dict(o),'credits':cr['total'],'revenue':revenue,'role':e['role']}
+    return {'products':dict(p),'open_orders':dict(o),'credits':cr['total'],'revenue':revenue,'po_drafts':po_drafts,'role':e['role']}
 @app.get('/api/order-products')
 def order_products(authorization:Optional[str]=Header(None)):
     employee(authorization); c=db(); r=c.execute('SELECT id,name,category,price,stock,image_url FROM products WHERE active=1 ORDER BY category,name').fetchall(); c.close(); return [dict(x) for x in r]
@@ -172,14 +179,18 @@ def add_product(x:ProductIn,authorization:Optional[str]=Header(None)):
         cur=c.execute('INSERT INTO products(code,name,category,supplier,cost,price,stock,alert,target,image_url) VALUES(?,?,?,?,?,?,?,?,?,?)',(code,name,x.category.strip() or 'Autres',x.supplier.strip(),x.cost,x.price,x.stock,x.alert,x.target,x.image_url.strip())); pid=cur.lastrowid
         if x.stock>0: c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(pid,'in',x.stock,'Stock initial',now(),e['id']))
     except sqlite3.IntegrityError: c.close(); raise HTTPException(409,'Code article déjà utilisé')
-    c.commit(); c.close(); log(e,'CREATION_ARTICLE',name); return {'id':pid,'code':code}
+    sync_purchase_orders(c); c.commit(); c.close(); log(e,'CREATION_ARTICLE',name); return {'id':pid,'code':code}
 @app.patch('/api/products/{pid}')
 def update_product(pid:int,x:dict,authorization:Optional[str]=Header(None)):
     e=employee(authorization); admin_or_share(e); c=db(); row=c.execute('SELECT * FROM products WHERE id=? AND active=1',(pid,)).fetchone()
     if not row: c.close(); raise HTTPException(404,'Article introuvable')
     name=str(x.get('name',row['name'])).strip(); image_url=str(x.get('image_url',row['image_url'] or '')).strip()
     if not name: c.close(); raise HTTPException(400,'Libellé obligatoire')
-    c.execute('UPDATE products SET name=?,image_url=? WHERE id=? AND active=1',(name,image_url,pid)); c.commit(); c.close()
+    try: alert=float(x.get('alert',row['alert'])); target=float(x.get('target',row['target']))
+    except (TypeError,ValueError): c.close(); raise HTTPException(400,'Seuil ou stock cible invalide')
+    if alert<0 or target<0: c.close(); raise HTTPException(400,'Le seuil et le stock cible ne peuvent pas être négatifs.')
+    supplier=str(x.get('supplier',row['supplier'] or '')).strip()
+    c.execute('UPDATE products SET name=?,image_url=?,alert=?,target=?,supplier=? WHERE id=? AND active=1',(name,image_url,alert,target,supplier,pid)); sync_purchase_orders(c); c.commit(); c.close()
     log(e,'MODIFICATION_ARTICLE',name); return {'ok':True}
 @app.delete('/api/products/{pid}')
 def archive_product(pid:int,authorization:Optional[str]=Header(None)):
@@ -194,7 +205,7 @@ def movement(x:MoveIn,authorization:Optional[str]=Header(None)):
     if not p: c.close(); raise HTTPException(404,'Produit introuvable')
     delta=x.qty if x.kind=='in' else (-x.qty if x.kind=='out' else x.qty-p['stock'])
     if p['stock']+delta<0: c.close(); raise HTTPException(400,'Stock insuffisant')
-    c.execute('UPDATE products SET stock=stock+? WHERE id=?',(delta,x.product_id)); c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(x.product_id,x.kind,x.qty,x.note,now(),e['id'])); c.commit(); c.close(); log(e,'MOUVEMENT_STOCK',f"{p['name']} {x.kind} {x.qty}"); return {'ok':True}
+    c.execute('UPDATE products SET stock=stock+? WHERE id=?',(delta,x.product_id)); c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(x.product_id,x.kind,x.qty,x.note,now(),e['id'])); sync_purchase_orders(c); c.commit(); c.close(); log(e,'MOUVEMENT_STOCK',f"{p['name']} {x.kind} {x.qty}"); return {'ok':True}
 @app.get('/api/wholesale-purchases')
 def wholesale_purchases(authorization:Optional[str]=Header(None)):
     e=employee(authorization); admin_or_share(e); c=db()
@@ -222,6 +233,7 @@ def add_wholesale_purchase(x:WholesalePurchaseIn,authorization:Optional[str]=Hea
             (x.product_id,x.packs,x.units_per_pack,total_units,x.purchase_price_per_pack,total_cost,incoming_unit_cost,x.note.strip(),now(),e['id']))
         c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',
             (x.product_id,'in',total_units,f'Achat en gros #{cur.lastrowid} : {x.packs:g} colis × {x.units_per_pack:g} unités',now(),e['id']))
+        sync_purchase_orders(c)
         c.commit()
     except HTTPException:
         c.rollback(); c.close(); raise
@@ -239,7 +251,76 @@ def add_table(x:TableIn,authorization:Optional[str]=Header(None)):
     try: cur=c.execute('INSERT INTO tables_room(name) VALUES(?)',(x.name.strip(),)); tid=cur.lastrowid
     except sqlite3.IntegrityError: c.close(); raise HTTPException(409,'Cette table existe déjà')
     c.commit(); c.close(); log(e,'CREATION_TABLE',x.name); return {'id':tid}
-def create_order(table_id,customer,items,source,token,eid):
+# ---------------- Bons de commande automatiques ----------------
+def sync_purchase_orders(c):
+    """Tout article actif dont le stock atteint le seuil minimum est ajouté à un bon « brouillon »
+    (un par fournisseur), avec la quantité nécessaire pour atteindre le stock cible et le prix d'achat enregistré.
+    Un article déjà présent sur un bon « commandé » n'est pas recommandé. Dès que le stock repasse au-dessus du
+    seuil, sa ligne disparaît du brouillon."""
+    for p in c.execute('SELECT * FROM products WHERE active=1').fetchall():
+        stock=float(p['stock'] or 0); alert=float(p['alert'] or 0); target=float(p['target'] or 0)
+        draft=c.execute("SELECT i.id FROM purchase_order_items i JOIN purchase_orders o ON o.id=i.po_id WHERE i.product_id=? AND o.status='draft'",(p['id'],)).fetchone()
+        ordered=c.execute("SELECT 1 FROM purchase_order_items i JOIN purchase_orders o ON o.id=i.po_id WHERE i.product_id=? AND o.status='ordered'",(p['id'],)).fetchone()
+        if alert>0 and stock<=alert:
+            if draft: c.execute('UPDATE purchase_order_items SET unit_cost=? WHERE id=?',(float(p['cost'] or 0),draft['id'])); continue
+            if ordered: continue
+            sup=(p['supplier'] or '').strip()
+            po=c.execute("SELECT id FROM purchase_orders WHERE status='draft' AND supplier=?",(sup,)).fetchone()
+            poid=po['id'] if po else c.execute('INSERT INTO purchase_orders(supplier,status,created,updated) VALUES(?,?,?,?)',(sup,'draft',now(),now())).lastrowid
+            need=target-stock
+            if need<=0: need=alert*2-stock
+            c.execute('INSERT INTO purchase_order_items(po_id,product_id,qty,unit_cost) VALUES(?,?,?,?)',(poid,p['id'],max(1.0,float(math.ceil(need))),float(p['cost'] or 0)))
+        elif draft:
+            c.execute('DELETE FROM purchase_order_items WHERE id=?',(draft['id'],))
+    c.execute("DELETE FROM purchase_orders WHERE status='draft' AND id NOT IN (SELECT DISTINCT po_id FROM purchase_order_items)")
+
+# ---------------- Fidélité client ----------------
+LOYALTY_DEFAULTS={'loyalty_enabled':'1','loyalty_points_per':'1000','loyalty_threshold':'100','loyalty_discount_pct':'5'}
+def _num(v,d):
+    try: return float(v)
+    except (TypeError,ValueError): return float(d)
+def loyalty_settings(c):
+    s=dict(LOYALTY_DEFAULTS)
+    for r in c.execute("SELECT key,value FROM app_settings WHERE key LIKE 'loyalty_%'"): s[r['key']]=r['value']
+    return {'enabled':s['loyalty_enabled']=='1','points_per':max(1.0,_num(s['loyalty_points_per'],1000)),'threshold':max(1.0,_num(s['loyalty_threshold'],100)),'discount_pct':min(100.0,max(0.0,_num(s['loyalty_discount_pct'],5)))}
+def norm_phone(phone):
+    d=re.sub(r'\D','',phone or '')
+    if d.startswith('237') and len(d)==12: d=d[3:]
+    if d and len(d)<8: raise HTTPException(400,'Numéro de client invalide (8 chiffres minimum).')
+    return d
+def apply_pct(price,pct): return float(round(float(price)*(1-pct/100.0))) if pct>0 else float(price)
+def finalize_loyalty(c,oid,phone,name):
+    """Associe le client (numéro) au reçu et applique la réduction fidélité si le palier est atteint.
+    À appeler juste après l'insertion des lignes au prix catalogue. Une réduction déjà accordée à ce reçu est conservée
+    (sans déduire de nouveaux points) et appliquée aux nouvelles lignes."""
+    o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone(); pct=float(o['discount_pct'] or 0); s=loyalty_settings(c); cid=o['customer_id']
+    if phone and (cid is None or pct==0):
+        cust=c.execute('SELECT * FROM customers WHERE phone=?',(phone,)).fetchone(); nm=(name or '').strip()
+        if nm.lower()=='client': nm=''
+        if not cust:
+            c.execute('INSERT INTO customers(phone,name,points,total_spent,created) VALUES(?,?,0,0,?)',(phone,nm,now())); cust=c.execute('SELECT * FROM customers WHERE phone=?',(phone,)).fetchone()
+        elif nm and not cust['name']: c.execute('UPDATE customers SET name=? WHERE id=?',(nm,cust['id']))
+        cid=cust['id']; c.execute('UPDATE orders SET customer_id=? WHERE id=?',(cid,oid))
+    if cid and pct==0 and s['enabled'] and s['discount_pct']>0:
+        cust=c.execute('SELECT * FROM customers WHERE id=?',(cid,)).fetchone()
+        if cust and float(cust['points'] or 0)>=s['threshold']:
+            c.execute('UPDATE customers SET points=points-? WHERE id=?',(s['threshold'],cid)); pct=s['discount_pct']
+    if pct>0:
+        items=c.execute('SELECT id,qty,unit_price FROM order_items WHERE order_id=?',(oid,)).fetchall()
+        base=sum(i['qty']*i['unit_price'] for i in items); new=0.0
+        for i in items:
+            up=apply_pct(i['unit_price'],pct); new+=i['qty']*up; c.execute('UPDATE order_items SET unit_price=? WHERE id=?',(up,i['id']))
+        c.execute('UPDATE orders SET discount_pct=?,discount_amount=? WHERE id=?',(pct,base-new,oid))
+def accrue_points(c,oid,amount):
+    o=c.execute('SELECT customer_id FROM orders WHERE id=?',(oid,)).fetchone() if oid else None
+    if not o or not o['customer_id']: return 0.0
+    s=loyalty_settings(c)
+    if not s['enabled']: return 0.0
+    pts=float(amount)/s['points_per']
+    c.execute('UPDATE customers SET points=points+?,total_spent=total_spent+? WHERE id=?',(pts,amount,o['customer_id']))
+    c.execute('UPDATE orders SET points_earned=points_earned+? WHERE id=?',(pts,oid))
+    return pts
+def create_order(table_id,customer,items,source,token,eid,phone=''):
     c=db()
     if table_id and not c.execute('SELECT id FROM tables_room WHERE id=? AND active=1',(table_id,)).fetchone(): c.close(); raise HTTPException(404,'Table inconnue')
     if not items: c.close(); raise HTTPException(400,'Commande vide')
@@ -250,10 +331,11 @@ def create_order(table_id,customer,items,source,token,eid):
     cur=c.execute("INSERT INTO orders(table_id,customer,status,source,token,created,employee_id) VALUES(?,?, 'pending',?,?,?,?)",(table_id,customer,source,token,now(),eid)); oid=cur.lastrowid
     for it in items:
         p=c.execute('SELECT * FROM products WHERE id=?',(it.product_id,)).fetchone(); c.execute('INSERT INTO order_items(order_id,product_id,qty,unit_price,unit_cost,category) VALUES(?,?,?,?,?,?)',(oid,it.product_id,it.qty,p['price'],p['cost'],p['category'] or 'Autres')); c.execute('UPDATE products SET stock=stock-? WHERE id=?',(it.qty,it.product_id)); c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(it.product_id,'sale',it.qty,f'Commande #{oid}',now(),eid))
-    c.commit(); c.close(); return oid
+    if phone: finalize_loyalty(c,oid,phone,customer)
+    sync_purchase_orders(c); c.commit(); c.close(); return oid
 @app.post('/api/orders')
 def new_order(x:OrderIn,authorization:Optional[str]=Header(None)):
-    e=employee(authorization); allow(e,'admin','shareholder','service','cashier'); oid=create_order(x.table_id,x.customer,x.items,x.source,None,e['id']); log(e,'COMMANDE_CREEE',f'Commande #{oid}'); return {'id':oid}
+    e=employee(authorization); allow(e,'admin','shareholder','service','cashier'); phone=norm_phone(x.customer_phone); oid=create_order(x.table_id,x.customer,x.items,x.source,None,e['id'],phone); log(e,'COMMANDE_CREEE',f'Commande #{oid}'); return {'id':oid}
 @app.get('/api/orders')
 def orders(authorization:Optional[str]=Header(None)):
     employee(authorization); c=db(); rows=c.execute("SELECT o.*,t.name table_name,coalesce(sum(i.qty*i.unit_price),0) total FROM orders o LEFT JOIN tables_room t ON t.id=o.table_id LEFT JOIN order_items i ON i.order_id=o.id WHERE o.status IN ('pending','served') GROUP BY o.id ORDER BY o.created DESC").fetchall(); out=[]
@@ -262,7 +344,7 @@ def orders(authorization:Optional[str]=Header(None)):
     c.close(); return out
 @app.patch('/api/orders/{oid}')
 def edit_order(oid:int,x:OrderIn,authorization:Optional[str]=Header(None)):
-    e=employee(authorization); allow(e,'admin','shareholder','service','cashier'); c=db(); o=c.execute("SELECT * FROM orders WHERE id=? AND status IN ('pending','served')",(oid,)).fetchone()
+    e=employee(authorization); allow(e,'admin','shareholder','service','cashier'); phone=norm_phone(x.customer_phone); c=db(); o=c.execute("SELECT * FROM orders WHERE id=? AND status IN ('pending','served')",(oid,)).fetchone()
     if not o: c.close(); raise HTTPException(404,'Reçu non modifiable ou introuvable')
     if o['paid']>0 or o['credit']>0: c.close(); raise HTTPException(400,'Un reçu déjà partiellement réglé ne peut plus être modifié.')
     old=c.execute('SELECT * FROM order_items WHERE order_id=?',(oid,)).fetchall()
@@ -275,7 +357,7 @@ def edit_order(oid:int,x:OrderIn,authorization:Optional[str]=Header(None)):
     c.execute('DELETE FROM order_items WHERE order_id=?',(oid,))
     for it in x.items:
         p=c.execute('SELECT * FROM products WHERE id=?',(it.product_id,)).fetchone(); c.execute('INSERT INTO order_items(order_id,product_id,qty,unit_price,unit_cost,category) VALUES(?,?,?,?,?,?)',(oid,it.product_id,it.qty,p['price'],p['cost'],p['category'] or 'Autres')); c.execute('UPDATE products SET stock=stock-? WHERE id=?',(it.qty,it.product_id))
-    c.execute('UPDATE orders SET customer=? WHERE id=?',(x.customer,oid)); c.commit(); c.close(); log(e,'MODIFICATION_RECU',f'Commande #{oid}'); return {'ok':True}
+    c.execute('UPDATE orders SET customer=? WHERE id=?',(x.customer,oid)); finalize_loyalty(c,oid,phone,x.customer); sync_purchase_orders(c); c.commit(); c.close(); log(e,'MODIFICATION_RECU',f'Commande #{oid}'); return {'ok':True}
 @app.patch('/api/orders/{oid}/edit-paid')
 def edit_paid_order(oid:int,x:OrderIn,authorization:Optional[str]=Header(None)):
     """Corrige un reçu payé : stock compensé et lignes comptables remplacées."""
@@ -299,21 +381,24 @@ def edit_paid_order(oid:int,x:OrderIn,authorization:Optional[str]=Header(None)):
             if not p: raise HTTPException(400,f'Article {it.product_id} introuvable ou archivé.')
             if float(p['stock'])+0.000001<float(it.qty): raise HTTPException(400,f'Stock insuffisant pour {p["name"]}. Disponible : {p["stock"]}.')
             new_lines.append((it,p))
-        new_total=sum(float(it.qty)*float(p['price']) for it,p in new_lines)
+        pct=float(o['discount_pct'] or 0)
+        new_total=sum(float(it.qty)*apply_pct(p['price'],pct) for it,p in new_lines)
+        base_total=sum(float(it.qty)*float(p['price']) for it,p in new_lines)
         paid=float(o['paid'] or 0)
         if new_total+0.001<paid:
             raise HTTPException(400,f'Le nouveau total ({new_total:.2f}) est inférieur au montant déjà encaissé ({paid:.2f}). Une procédure de remboursement est nécessaire avant cette correction.')
         c.execute('DELETE FROM order_items WHERE order_id=?',(oid,))
         for it,p in new_lines:
-            c.execute('INSERT INTO order_items(order_id,product_id,qty,unit_price,unit_cost,category) VALUES(?,?,?,?,?,?)',(oid,it.product_id,it.qty,p['price'],p['cost'],p['category'] or 'Autres'))
+            c.execute('INSERT INTO order_items(order_id,product_id,qty,unit_price,unit_cost,category) VALUES(?,?,?,?,?,?)',(oid,it.product_id,it.qty,apply_pct(p['price'],pct),p['cost'],p['category'] or 'Autres'))
             c.execute('UPDATE products SET stock=stock-? WHERE id=?',(it.qty,it.product_id))
             c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(it.product_id,'sale',it.qty,f'Correction reçu payé #{oid}',now(),e['id']))
         for it in old:
             c.execute('INSERT INTO movements(product_id,kind,qty,note,created,employee_id) VALUES(?,?,?,?,?,?)',(it['product_id'],'return',it['qty'],f'Restitution avant correction reçu #{oid}',now(),e['id']))
         new_status='paid' if abs(new_total-paid)<=0.001 else 'pending'
-        c.execute('UPDATE orders SET customer=?,status=? WHERE id=?',(x.customer, new_status, oid))
+        c.execute('UPDATE orders SET customer=?,status=?,discount_amount=? WHERE id=?',(x.customer, new_status, (base_total-new_total) if pct>0 else 0, oid))
         detail=f'Reçu #{oid}: total précédent remplacé; nouveau total={new_total:.2f}; déjà encaissé={paid:.2f}; statut={new_status}'
         c.execute('INSERT INTO audit(employee_id,action,details,created) VALUES(?,?,?,?)',(e['id'],'CORRECTION_RECU_PAYE',detail,now()))
+        sync_purchase_orders(c)
         c.commit()
         return {'ok':True,'id':oid,'new_total':new_total,'paid':paid,'remaining':max(0,new_total-paid),'status':new_status}
     except HTTPException:
@@ -330,9 +415,9 @@ def pay(oid:int,x:PayIn,authorization:Optional[str]=Header(None)):
     total=c.execute('SELECT coalesce(sum(qty*unit_price),0) FROM order_items WHERE order_id=?',(oid,)).fetchone()[0]; due=total-o['paid']-o['credit']
     if x.amount<=0 or x.amount>due+0.001: c.close(); raise HTTPException(400,'Montant invalide')
     method=normalize_payment_method(x.method)
-    c.execute('INSERT INTO payments(order_id,amount,method,created,employee_id) VALUES(?,?,?,?,?)',(oid,x.amount,method,now(),e['id'])); c.execute('UPDATE orders SET paid=paid+? WHERE id=?',(x.amount,oid)); left=due-x.amount
+    c.execute('INSERT INTO payments(order_id,amount,method,created,employee_id) VALUES(?,?,?,?,?)',(oid,x.amount,method,now(),e['id'])); c.execute('UPDATE orders SET paid=paid+? WHERE id=?',(x.amount,oid)); pts=accrue_points(c,oid,x.amount); left=due-x.amount
     if left<=0.001: c.execute("UPDATE orders SET status='paid' WHERE id=?",(oid,))
-    c.commit(); c.close(); log(e,'PAIEMENT',f'Commande #{oid}: {x.amount}'); return {'remaining':max(0,left)}
+    cp=c.execute('SELECT c.points FROM orders o JOIN customers c ON c.id=o.customer_id WHERE o.id=?',(oid,)).fetchone(); c.commit(); c.close(); log(e,'PAIEMENT',f'Commande #{oid}: {x.amount}'); return {'remaining':max(0,left),'points_earned':round(pts,2),'customer_points':(float(cp['points']) if cp else None)}
 @app.post('/api/orders/{oid}/credit')
 def credit(oid:int,authorization:Optional[str]=Header(None)):
     e=employee(authorization); allow(e,'admin','shareholder','cashier'); c=db(); o=c.execute("SELECT * FROM orders WHERE id=? AND status IN ('pending','served')",(oid,)).fetchone()
@@ -358,12 +443,16 @@ def pay_credit(cid:int,x:CreditPay,authorization:Optional[str]=Header(None)):
     if not cr: c.close(); raise HTTPException(404,'Ardoise introuvable')
     if x.amount<=0 or x.amount>cr['balance']: c.close(); raise HTTPException(400,'Montant invalide')
     method=normalize_payment_method(x.method)
-    c.execute('INSERT INTO credit_payments(credit_id,amount,created,employee_id,method) VALUES(?,?,?,?,?)',(cid,x.amount,now(),e['id'],method)); c.execute('UPDATE credits SET balance=balance-? WHERE id=?',(x.amount,cid)); c.commit(); c.close(); log(e,'REGLEMENT_ARDOISE',f'Ardoise #{cid}: {x.amount}'); return {'ok':True}
+    c.execute('INSERT INTO credit_payments(credit_id,amount,created,employee_id,method) VALUES(?,?,?,?,?)',(cid,x.amount,now(),e['id'],method)); c.execute('UPDATE credits SET balance=balance-? WHERE id=?',(x.amount,cid)); accrue_points(c,cr['order_id'],x.amount); c.commit(); c.close(); log(e,'REGLEMENT_ARDOISE',f'Ardoise #{cid}: {x.amount}'); return {'ok':True}
 @app.get('/api/receipt/{oid}')
 def receipt(oid:int,authorization:Optional[str]=Header(None)):
     employee(authorization); c=db(); o=c.execute('SELECT o.*,t.name table_name FROM orders o LEFT JOIN tables_room t ON t.id=o.table_id WHERE o.id=?',(oid,)).fetchone()
     if not o: c.close(); raise HTTPException(404,'Reçu introuvable')
-    items=[dict(x) for x in c.execute("SELECT i.*,COALESCE(p.name,'Article archivé') product_name FROM order_items i LEFT JOIN products p ON p.id=i.product_id WHERE i.order_id=?",(oid,))]; c.close(); return {'order':dict(o),'items':items,'total':sum(i['qty']*i['unit_price'] for i in items)}
+    items=[dict(x) for x in c.execute("SELECT i.*,COALESCE(p.name,'Article archivé') product_name FROM order_items i LEFT JOIN products p ON p.id=i.product_id WHERE i.order_id=?",(oid,))]
+    cust=None
+    if o['customer_id']:
+        r=c.execute('SELECT name,phone,points FROM customers WHERE id=?',(o['customer_id'],)).fetchone(); cust=dict(r) if r else None
+    c.close(); return {'order':dict(o),'items':items,'total':sum(i['qty']*i['unit_price'] for i in items),'customer':cust}
 @app.post('/api/customer/{table_id}/order')
 def customer_order(table_id:int,x:OrderIn):
     oid=create_order(table_id,x.customer,x.items,'client',None,None); return {'id':oid,'message':'Commande transmise à la caisse.'}
@@ -516,12 +605,13 @@ def reports(period:str='day',anchor:Optional[str]=None,authorization:Optional[st
         if pr['order_id'] is None: continue
         t=c.execute('SELECT COALESCE(SUM(qty*unit_price),0) s,COALESCE(SUM(qty*unit_cost),0) k FROM order_items WHERE order_id=?',(pr['order_id'],)).fetchone()
         if t['s']>0: realized_profit+=float(pr['amount'])*(t['s']-t['k'])/t['s']
+    loyalty_discounts=c.execute("SELECT COALESCE(SUM(discount_amount),0) v FROM orders WHERE status IN ('paid','credit') AND substr(created,1,10) BETWEEN ? AND ?",(start,end)).fetchone()['v']
     c.close()
     groups={k:{'key':k,'label':GROUP_LABELS[k],'sales':0,'cost':0,'gross_profit':0,'quantity':0,'categories':[]} for k in ('spiritueux','boissons')}
     for r in categories:
         g=groups[category_group(r['category'])]; g['sales']+=r['sales']; g['cost']+=r['cost']; g['gross_profit']+=r['gross_profit']; g['quantity']+=r['quantity']; g['categories'].append(r['category'])
     gross=sales-cost
-    return {'period':period,'start':start,'end':end,'sales':sales,'cost_of_goods':cost,'gross_profit':gross,'expenses':expenses,'net_estimate':gross-expenses,'orders':count,'by_category':[dict(x) for x in categories], 'cash_received':cash_received, 'mobile_received':mobile_received, 'other_received':other_received, 'total_received':total_received, 'realized_profit':realized_profit, 'groups':list(groups.values()), 'payments_by_method':payment_breakdown}
+    return {'period':period,'start':start,'end':end,'sales':sales,'cost_of_goods':cost,'gross_profit':gross,'expenses':expenses,'net_estimate':gross-expenses,'orders':count,'by_category':[dict(x) for x in categories], 'cash_received':cash_received, 'mobile_received':mobile_received, 'other_received':other_received, 'total_received':total_received, 'realized_profit':realized_profit,'loyalty_discounts':loyalty_discounts, 'groups':list(groups.values()), 'payments_by_method':payment_breakdown}
 @app.get('/api/reports/category-detail')
 def report_category_detail(start:str,end:str,category:str,authorization:Optional[str]=Header(None)):
     e=employee(authorization); admin_or_share(e)
@@ -529,6 +619,55 @@ def report_category_detail(start:str,end:str,category:str,authorization:Optional
     except ValueError: raise HTTPException(400,'Dates invalides')
     c=db(); rows=c.execute("SELECT i.product_id, COALESCE(p.name,'Article archivé') name, SUM(i.qty) quantity, SUM(i.qty*i.unit_price) sales, SUM(i.qty*i.unit_cost) cost, SUM(i.qty*(i.unit_price-i.unit_cost)) gross_profit FROM order_items i JOIN orders o ON o.id=i.order_id LEFT JOIN products p ON p.id=i.product_id WHERE o.status IN ('paid','credit') AND substr(o.created,1,10) BETWEEN ? AND ? AND COALESCE(NULLIF(i.category,''),'Autres')=? GROUP BY i.product_id ORDER BY sales DESC",(start,end,category)).fetchall(); c.close()
     return {'category':category,'start':start,'end':end,'products':[dict(r) for r in rows]}
+@app.get('/api/purchase-orders')
+def list_purchase_orders(authorization:Optional[str]=Header(None)):
+    e=employee(authorization); admin_or_share(e); c=db(); sync_purchase_orders(c); c.commit()
+    rows=c.execute("SELECT * FROM purchase_orders WHERE status IN ('draft','ordered') ORDER BY CASE status WHEN 'draft' THEN 0 ELSE 1 END, id DESC").fetchall()
+    rows=list(rows)+list(c.execute("SELECT * FROM purchase_orders WHERE status IN ('received','cancelled') ORDER BY id DESC LIMIT 5").fetchall()); out=[]
+    for r in rows:
+        d=dict(r); d['items']=[dict(i) for i in c.execute("SELECT i.id,i.product_id,i.qty,i.unit_cost,COALESCE(p.name,'Article archivé') name,COALESCE(p.stock,0) stock,COALESCE(p.alert,0) alert,COALESCE(p.target,0) target FROM purchase_order_items i LEFT JOIN products p ON p.id=i.product_id WHERE i.po_id=? ORDER BY p.category,p.name",(r['id'],))]
+        d['total']=sum(i['qty']*i['unit_cost'] for i in d['items']); out.append(d)
+    c.close(); return out
+@app.patch('/api/purchase-orders/{pid}/items/{iid}')
+def set_po_item_qty(pid:int,iid:int,x:dict,authorization:Optional[str]=Header(None)):
+    e=employee(authorization); admin_or_share(e)
+    try: qty=float(x.get('qty'))
+    except (TypeError,ValueError): raise HTTPException(400,'Quantité invalide')
+    if qty<=0: raise HTTPException(400,'La quantité doit être positive.')
+    c=db(); po=c.execute("SELECT * FROM purchase_orders WHERE id=? AND status='draft'",(pid,)).fetchone()
+    if not po: c.close(); raise HTTPException(404,'Bon de commande introuvable ou déjà validé')
+    cur=c.execute('UPDATE purchase_order_items SET qty=? WHERE id=? AND po_id=?',(qty,iid,pid))
+    if cur.rowcount==0: c.close(); raise HTTPException(404,'Ligne introuvable')
+    c.execute('UPDATE purchase_orders SET updated=? WHERE id=?',(now(),pid)); c.commit(); c.close(); return {'ok':True}
+@app.post('/api/purchase-orders/{pid}/status')
+def set_po_status(pid:int,x:dict,authorization:Optional[str]=Header(None)):
+    e=employee(authorization); admin_or_share(e); new=str(x.get('status','')); allowed={'draft':('ordered',),'ordered':('received','cancelled')}
+    c=db(); po=c.execute('SELECT * FROM purchase_orders WHERE id=?',(pid,)).fetchone()
+    if not po: c.close(); raise HTTPException(404,'Bon de commande introuvable')
+    if new not in allowed.get(po['status'],()): c.close(); raise HTTPException(400,'Changement de statut impossible.')
+    c.execute('UPDATE purchase_orders SET status=?,updated=? WHERE id=?',(new,now(),pid)); sync_purchase_orders(c); c.commit(); c.close()
+    log(e,'BON_DE_COMMANDE',f'Bon #{pid} : {po["status"]} -> {new}'); return {'ok':True}
+@app.get('/api/loyalty/settings')
+def get_loyalty_settings(authorization:Optional[str]=Header(None)):
+    e=employee(authorization); admin_or_share(e); c=db(); s=loyalty_settings(c); c.close(); return s
+@app.post('/api/loyalty/settings')
+def set_loyalty_settings(x:dict,authorization:Optional[str]=Header(None)):
+    e=employee(authorization); admin_or_share(e)
+    try: per=float(x.get('points_per')); thr=float(x.get('threshold')); pct=float(x.get('discount_pct'))
+    except (TypeError,ValueError): raise HTTPException(400,'Valeurs invalides')
+    if per<1 or thr<1 or pct<0 or pct>100: raise HTTPException(400,'Vérifiez les valeurs : FCFA par point ≥ 1, palier ≥ 1, réduction entre 0 et 100 %.')
+    c=db()
+    for k,v in (('loyalty_enabled','1' if x.get('enabled') else '0'),('loyalty_points_per',str(per)),('loyalty_threshold',str(thr)),('loyalty_discount_pct',str(pct))):
+        c.execute('INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(k,v))
+    c.commit(); c.close(); log(e,'REGLAGE_FIDELITE',f'1 point / {per:g} FCFA, palier {thr:g} points, réduction {pct:g} %'); return {'ok':True}
+@app.get('/api/loyalty/customer')
+def loyalty_customer(phone:str,authorization:Optional[str]=Header(None)):
+    employee(authorization); ph=norm_phone(phone); c=db(); s=loyalty_settings(c); r=c.execute('SELECT * FROM customers WHERE phone=?',(ph,)).fetchone() if ph else None; c.close()
+    pts=float(r['points']) if r else 0.0
+    return {'phone':ph,'found':bool(r),'name':(r['name'] if r else ''),'points':pts,'points_display':int(pts),'threshold':s['threshold'],'discount_pct':s['discount_pct'],'enabled':s['enabled'],'eligible':bool(s['enabled'] and pts>=s['threshold']),'points_missing':max(0,math.ceil(s['threshold']-pts))}
+@app.get('/api/loyalty/customers')
+def loyalty_customers(authorization:Optional[str]=Header(None)):
+    e=employee(authorization); admin_or_share(e); c=db(); r=c.execute('SELECT * FROM customers ORDER BY points DESC,total_spent DESC').fetchall(); c.close(); return [dict(x) for x in r]
 @app.get('/api/audit')
 def audit(authorization:Optional[str]=Header(None)):
     e=employee(authorization); allow(e,'admin','shareholder','cashier'); c=db(); r=c.execute('SELECT a.*,e.name employee FROM audit a LEFT JOIN employees e ON e.id=a.employee_id ORDER BY a.id DESC LIMIT 300').fetchall(); c.close(); return [dict(x) for x in r]
@@ -559,7 +698,7 @@ def reset_data(payload:dict,authorization:Optional[str]=Header(None)):
     c=db()
     # On conserve les employés, leurs PIN, les sessions, les paramètres et la structure SQL.
     # Les tables opérationnelles sont vidées, y compris produits, ventes, stocks, tables et historique.
-    for table in ('credit_payments','credits','payments','order_items','orders','movements','stock_purchases','attendance','expenses','audit','tables_room','products'):
+    for table in ('credit_payments','credits','payments','order_items','orders','movements','stock_purchases','purchase_order_items','purchase_orders','customers','attendance','expenses','audit','tables_room','products'):
         c.execute(f'DELETE FROM {table}')
     # Réinitialiser les compteurs des tables de données vidées sans toucher aux employés.
     c.commit(); c.close()
